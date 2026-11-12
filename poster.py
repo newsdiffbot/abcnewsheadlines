@@ -82,6 +82,7 @@ REGULAR_FONT = str(FONT_DIR / "SourceSerifPro-Regular.ttf")
 BOLD_FONT = str(FONT_DIR / "SourceSerifPro-Bold.ttf")
 
 UNCHANGED, REMOVED, ADDED = "=", "-", "+"  # the kinds of token in a word diff (the symbols are difflib-style)
+LINE_BREAK = "\n"  # a token with this text ends the line
 TOKEN_PATTERN = re.compile(r"\s+|\w+(?:[’'\-]\w+)*|[^\w\s]")  # spaces, words (don't, witch-hunt), punctuation
 MOSTLY_DIFFERENT = 0.5  # below this word similarity, show the old headline struck out, then the new one
 
@@ -135,7 +136,7 @@ def diff_tokens(old: str, new: str) -> list[Token]:
     if difflib.SequenceMatcher(None, old_words, new_words, autojunk=False).ratio() < MOSTLY_DIFFERENT:
         removed = [Token(REMOVED, t) for t in old_tokens]
         added = [Token(ADDED, t) for t in new_tokens]
-        return [*removed, Token(UNCHANGED, " "), *added]
+        return [*removed, Token(UNCHANGED, LINE_BREAK), *added]  # a full replacement: the new text starts a new line
 
     tokens: list[Token] = []
     matcher = difflib.SequenceMatcher(None, old_tokens, new_tokens, autojunk=False)
@@ -175,6 +176,10 @@ def wrap_tokens(tokens: list[Token], fonts: dict[str, ImageFont.FreeTypeFont],
     line: list[PlacedToken] = []
     x = 0.0
     for token in tokens:
+        if token.text == LINE_BREAK:
+            lines.append(line)
+            line, x = [], 0.0
+            continue
         font = fonts[token.kind]
         for text in split_to_fit(token.text, font, max_width):  # a word wider than the image is broken up
             width = font.getlength(text)
