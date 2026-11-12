@@ -1,12 +1,9 @@
 name: poll
 
 on:
+  schedule:
+    - cron: "*/5 * * * *"
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Dry run: poll and save state as usual, but don't post to Bluesky; log what would be posted to the step summary"
-        type: boolean
-        default: false
 
 concurrency:
   group: poll
@@ -45,13 +42,13 @@ jobs:
       - name: Post to Bluesky
         id: post
         env:
-          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
           BSKY_USERNAME: ${{ secrets.BSKY_USERNAME }}
           BSKY_PASSWORD: ${{ secrets.BSKY_PASSWORD }}
-        run: uv run --frozen poster.py $DRY_RUN | tee -a "$GITHUB_STEP_SUMMARY"
+        # Dry run: nothing is posted; what would be posted goes to the step summary. Remove --dry-run to post.
+        run: uv run --frozen poster.py --dry-run | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload dry-run output (images and would-post.json)
-        if: ${{ always() && inputs.dry_run }}
+        if: ${{ always() && github.event_name == 'workflow_dispatch' }}
         uses: actions/upload-artifact@v4
         with:
           name: preview
