@@ -1,0 +1,7 @@
+.claude/
+.ruff_cache/
+.venv/
+__pycache__/
+.env
+data/
+preview/

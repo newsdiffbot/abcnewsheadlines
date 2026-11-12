@@ -1,0 +1,68 @@
+name: poll
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: poll and save state as usual, but don't post to Bluesky; log what would be posted to the step summary"
+        type: boolean
+        default: false
+
+concurrency:
+  group: poll
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash # with pipefail, so `| tee` doesn't hide a failing script
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true # keyed on uv.lock
+
+      - run: uv sync --frozen # installs Python 3.14 (from .python-version) and the locked dependencies
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: state-none # never matches; restore-keys picks the newest "state-*"
+          restore-keys: state-
+
+      - name: Poll feeds
+        id: poll
+        run: uv run --frozen poller.py
+
+      - name: Post to Bluesky
+        id: post
+        env:
+          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+          BSKY_USERNAME: ${{ secrets.BSKY_USERNAME }}
+          BSKY_PASSWORD: ${{ secrets.BSKY_PASSWORD }}
+        run: uv run --frozen poster.py $DRY_RUN | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload dry-run output (images and would-post.json)
+        if: ${{ always() && inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview
+          path: preview
+          if-no-files-found: ignore
+
+      - name: Save state
+        # Only on the default branch, and only if something changed. always(): a post that succeeded must not be
+        # forgotten (and repeated) because a later step failed.
+        if: ${{ always() && (steps.poll.outputs.dirty == 'true' || steps.post.outputs.dirty == 'true') && github.ref_name == github.event.repository.default_branch }}
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
