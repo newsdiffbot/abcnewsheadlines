@@ -16,8 +16,9 @@ State and the change log live in --data-dir:
 Each run lists the --limit newest articles (default and maximum 250), fetches every listed article's
 detail JSON (rate-limited, see DETAIL_CONCURRENCY) and compares the tracked headline fields with the
 stored ones. Every listed article is polled each run because an article's own dates don't reliably
-change when its headline does; use --limit to poll fewer. Headlines and metadata only: article body
-text is never stored.
+change when its headline does; use --limit to poll fewer. An article is forgotten once it is missing from
+a full-size (250 item) listing, because it has aged out of the window; a --limit run, or a listing that
+comes back short, forgets nothing. Headlines and metadata only: article body text is never stored.
 
 Usage: uv run poller.py [--data-dir data] [--limit 250] [--dry-run] [--snapshot]
 """
@@ -51,7 +52,6 @@ DEFAULT_LIMIT = 250  # the listing's maximum (about 3.5 days of Just In)
 
 DEFAULT_REPO = "newsdiffbot/abcnewsheadlines"  # used in the User-Agent when run outside Actions
 SCHEMA = 3
-TTL_SECONDS = 72 * 3600  # forget articles not seen in the listing for this long
 
 # At most DETAIL_CONCURRENCY requests are in flight, and each slot waits DETAIL_DELAY_S after its
 # request: 2 requests per second at most, so 250 articles take about 2 minutes.
@@ -287,9 +287,11 @@ async def run(args: argparse.Namespace) -> int:
                 article["detail"] = result
                 dirty = True
 
-    for article_id in [i for i, a in articles.items() if now - a["last_seen"] > TTL_SECONDS]:
-        del articles[article_id]
-        dirty = True
+    if len(listed_ids) >= DEFAULT_LIMIT:  # a full-size listing is the whole window: what is missing has aged out
+        listed = set(listed_ids)
+        for article_id in [i for i in articles if i not in listed]:
+            del articles[article_id]
+            dirty = True
 
     print(f"{'COLD START ' if cold_start else ''}articles={len(articles)} (listed {len(listed_ids)}) "
           f"changes={len(changes)} details: fetched={fetched} failed={failed}")

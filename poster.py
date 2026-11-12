@@ -15,8 +15,8 @@ The first change to an article starts a thread, in the style of nytdiff.bsky.soc
          post in the thread. The alt text is "Before: ...\\nAfter: ...".
 If posted.json doesn't know an article's thread (say the cache was lost), the account's own recent posts
 are searched for it, and the thread is continued rather than started again.
-Changes older than --max-age are skipped, and at most --hourly-cap posts are made per hour (the rest stay
-pending until they age out).
+Every change is posted, oldest first, however long ago it was detected. An article's edits always go out
+in order: if one fails, the article's later edits wait for the next run.
 
 --dry-run never logs in or writes posted.json. It prints what it would post as markdown and writes, into
 --preview-dir, the images and would-post.json: every request exactly as it would be sent (with a placeholder
@@ -24,7 +24,7 @@ DID and placeholder references to its own earlier posts), for checking the threa
 attachments. (It can only look for existing threads if BSKY_USERNAME is set.)
 
 Environment: BSKY_USERNAME and BSKY_PASSWORD (an app password).
-Usage: uv run poster.py [--data-dir data] [--dry-run] [--preview-dir preview] [--max-age 120] [--hourly-cap 12]
+Usage: uv run poster.py [--data-dir data] [--dry-run] [--preview-dir preview]
 """
 
 import argparse
@@ -53,7 +53,7 @@ from atproto import Client, models
 from atproto.exceptions import AtProtocolError
 from PIL import Image, ImageDraw, ImageFont
 
-from poller import TTL_SECONDS, user_agent, write_text_atomic
+from poller import user_agent, write_text_atomic
 
 BlobRef = models.blob_ref.BlobRef
 IpldLink = models.blob_ref.IpldLink
@@ -89,8 +89,18 @@ PAPER, INK = (247, 244, 236), (28, 28, 30)
 HIGHLIGHT = {REMOVED: (248, 187, 198), ADDED: (160, 244, 202)}
 TEXT_COLOUR = {UNCHANGED: INK, REMOVED: (120, 20, 38), ADDED: (10, 70, 40)}
 
-DIFF_WIDTH, DIFF_PADDING, DIFF_FONT_SIZE, DIFF_LINE_HEIGHT = 800, 36, 36, 56
-HIGHLIGHT_MARGIN, HIGHLIGHT_TOP, HIGHLIGHT_BOTTOM, HIGHLIGHT_RADIUS = 4, 4, 8, 5
+DIFF_WIDTH, DIFF_PADDING = 800, 36
+DIFF_FONT_SIZES = (36, 32, 28, 24)  # tried in turn: the first at which the text fits in MAX_DIFF_LINES is used
+MAX_DIFF_LINES = 8
+# Proportions of the font size, which came from a 36 px font
+LINE_HEIGHT_RATIO, TEXT_OFFSET_RATIO, STRIKE_WIDTH_RATIO = 14 / 9, 1 / 18, 1 / 12
+HIGHLIGHT_MARGIN_RATIO, HIGHLIGHT_BOTTOM_RATIO, HIGHLIGHT_RADIUS_RATIO = 1 / 9, 2 / 9, 1 / 7
+
+THUMB_WIDTH, THUMB_HEIGHT, THUMB_PADDING = 1200, 630, 80
+THUMB_FONT_SIZES = range(76, 35, -4)  # 76, 72 ... 36: the largest at which the headline fits is used
+THUMB_LINE_SPACING = 1.2
+THUMB_CAPTION_SPACE = 70  # room kept clear for the caption under the headline
+THUMB_CAPTION_SIZE = 30
 
 
 class Token(NamedTuple):
@@ -109,6 +119,7 @@ class DiffImage(NamedTuple):
     png: bytes
     width: int
     height: int
+    font_size: int
 
 
 def encode_png(image: Image.Image) -> bytes:
@@ -144,83 +155,125 @@ def diff_tokens(old: str, new: str) -> list[Token]:
     return tokens
 
 
+def split_to_fit(text: str, font: ImageFont.FreeTypeFont, max_width: float) -> list[str]:
+    """The text as pieces no wider than max_width. Only a word too long for a whole line needs more than one."""
+    if font.getlength(text) <= max_width:
+        return [text]
+    pieces, current = [], ""
+    for character in text:
+        if current and font.getlength(current + character) > max_width:
+            pieces.append(current)
+            current = character
+        else:
+            current += character
+    return [*pieces, current]
+
+
 def wrap_tokens(tokens: list[Token], fonts: dict[str, ImageFont.FreeTypeFont],
                 max_width: float) -> list[list[PlacedToken]]:
     lines: list[list[PlacedToken]] = []
     line: list[PlacedToken] = []
     x = 0.0
     for token in tokens:
-        width = fonts[token.kind].getlength(token.text)
-        is_word = bool(token.text.strip())
-        if line and is_word and x + width > max_width:
-            lines.append(line)
-            line, x = [], 0.0
-        if not line and not is_word:
-            continue  # no leading space on a wrapped line
-        line.append(PlacedToken(token.kind, token.text, x, width))
-        x += width
+        font = fonts[token.kind]
+        for text in split_to_fit(token.text, font, max_width):  # a word wider than the image is broken up
+            width = font.getlength(text)
+            is_word = bool(text.strip())
+            if line and is_word and x + width > max_width:
+                lines.append(line)
+                line, x = [], 0.0
+            if not line and not is_word:
+                continue  # no leading space on a wrapped line
+            line.append(PlacedToken(token.kind, text, x, width))
+            x += width
     lines.append(line)
     return lines
 
 
 def render_diff_image(old: str, new: str) -> DiffImage:
-    regular, bold = ImageFont.truetype(REGULAR_FONT, DIFF_FONT_SIZE), ImageFont.truetype(BOLD_FONT, DIFF_FONT_SIZE)
-    fonts = {UNCHANGED: regular, REMOVED: regular, ADDED: bold}
-    lines = wrap_tokens(diff_tokens(old, new), fonts, DIFF_WIDTH - 2 * DIFF_PADDING)
-    height = 2 * DIFF_PADDING + len(lines) * DIFF_LINE_HEIGHT - (DIFF_LINE_HEIGHT - DIFF_FONT_SIZE) // 2
+    """The word diff on paper-coloured ground. The font shrinks, down to 24 px, when the text is long."""
+    tokens = diff_tokens(old, new)
+    for size in DIFF_FONT_SIZES:
+        regular, bold = ImageFont.truetype(REGULAR_FONT, size), ImageFont.truetype(BOLD_FONT, size)
+        fonts = {UNCHANGED: regular, REMOVED: regular, ADDED: bold}
+        lines = wrap_tokens(tokens, fonts, DIFF_WIDTH - 2 * DIFF_PADDING)
+        if len(lines) <= MAX_DIFF_LINES:
+            break  # otherwise the smallest size is kept and the image simply grows taller
+
+    line_height = round(size * LINE_HEIGHT_RATIO)
+    margin = round(size * HIGHLIGHT_MARGIN_RATIO)
+    bottom = round(size * HIGHLIGHT_BOTTOM_RATIO)
+    height = 2 * DIFF_PADDING + len(lines) * line_height - (line_height - size) // 2
     image = Image.new("RGB", (DIFF_WIDTH, height), PAPER)
     draw = ImageDraw.Draw(image)
 
     for row, line in enumerate(lines):
-        top = DIFF_PADDING + row * DIFF_LINE_HEIGHT
+        top = DIFF_PADDING + row * line_height
         while line and not line[-1].text.strip():
             line = line[:-1]
         for kind, run in itertools.groupby(line, key=lambda placed: placed.kind):  # one box per run
             run = list(run)
             if kind != UNCHANGED:
-                left = DIFF_PADDING + run[0].x - HIGHLIGHT_MARGIN
-                right = DIFF_PADDING + run[-1].x + run[-1].width + HIGHLIGHT_MARGIN
-                box = [left, top + HIGHLIGHT_TOP, right, top + DIFF_LINE_HEIGHT - HIGHLIGHT_BOTTOM]
-                draw.rounded_rectangle(box, radius=HIGHLIGHT_RADIUS, fill=HIGHLIGHT[kind])
+                left = DIFF_PADDING + run[0].x - margin
+                right = DIFF_PADDING + run[-1].x + run[-1].width + margin
+                draw.rounded_rectangle([left, top + margin, right, top + line_height - bottom],
+                                       radius=round(size * HIGHLIGHT_RADIUS_RATIO), fill=HIGHLIGHT[kind])
         for placed in line:
             left = DIFF_PADDING + placed.x
-            draw.text((left, top + 2), placed.text, font=fonts[placed.kind], fill=TEXT_COLOUR[placed.kind])
+            draw.text((left, top + round(size * TEXT_OFFSET_RATIO)), placed.text, font=fonts[placed.kind],
+                      fill=TEXT_COLOUR[placed.kind])
             if placed.kind == REMOVED and placed.text.strip():
-                strike_y = top + DIFF_LINE_HEIGHT // 2 - 1
-                draw.line([left, strike_y, left + placed.width, strike_y], fill=TEXT_COLOUR[REMOVED], width=3)
-    return DiffImage(encode_png(image), image.width, image.height)
+                strike_y = top + line_height // 2 - 1
+                draw.line([left, strike_y, left + placed.width, strike_y], fill=TEXT_COLOUR[REMOVED],
+                          width=max(2, round(size * STRIKE_WIDTH_RATIO)))
+    return DiffImage(encode_png(image), image.width, image.height, size)
 
 
 def wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: float) -> list[str]:
     lines, current = [], ""
     for word in text.split():
-        candidate = f"{current} {word}".strip()
-        if current and font.getlength(candidate) > max_width:
-            lines.append(current)
-            current = word
-        else:
-            current = candidate
+        for piece in split_to_fit(word, font, max_width):  # a word wider than the image is broken up
+            candidate = f"{current} {piece}".strip()
+            if current and font.getlength(candidate) > max_width:
+                lines.append(current)
+                current = piece
+            else:
+                current = candidate
     return [*lines, current]
+
+
+def fit_thumbnail_text(headline: str) -> tuple[list[str], int]:
+    """The wrapped headline and the largest font size (down to 36 px) at which it fits above the caption.
+    A headline too long even then is cut off with an ellipsis."""
+    max_width = THUMB_WIDTH - 2 * THUMB_PADDING
+    max_height = THUMB_HEIGHT - 2 * THUMB_PADDING - THUMB_CAPTION_SPACE
+    for size in THUMB_FONT_SIZES:
+        font = ImageFont.truetype(BOLD_FONT, size)
+        lines = wrap_text(headline, font, max_width)
+        if len(lines) * size * THUMB_LINE_SPACING <= max_height:
+            return lines, size
+    kept = lines[: int(max_height // (size * THUMB_LINE_SPACING))]
+    last = kept[-1]
+    while last and font.getlength(f"{last}…") > max_width:
+        last = last[:-1]
+    kept[-1] = f"{last.rstrip()}…"
+    return kept, size
 
 
 def render_thumbnail(headline: str, seen_at: str) -> bytes:
     """1200x630 (the shape link cards are cropped to): the headline on white, and when we saw it."""
-    width, height, padding = 1200, 630, 80
-    image = Image.new("RGB", (width, height), (255, 255, 255))
+    lines, size = fit_thumbnail_text(headline)
+    image = Image.new("RGB", (THUMB_WIDTH, THUMB_HEIGHT), (255, 255, 255))
     draw = ImageDraw.Draw(image)
-    font_size = 76
-    while True:
-        font = ImageFont.truetype(BOLD_FONT, font_size)
-        lines = wrap_text(headline, font, width - 2 * padding)
-        fits = len(lines) * font_size * 1.2 <= height - 2 * padding - 70
-        if fits or font_size <= 44:
-            break
-        font_size -= 4
+    font = ImageFont.truetype(BOLD_FONT, size)
     for row, line in enumerate(lines):
-        draw.text((padding, padding + int(row * font_size * 1.2)), line, font=font, fill=(24, 24, 27))
-    draw.rectangle([padding, height - padding - 52, padding + 90, height - padding - 48], fill=(24, 24, 27))
-    caption_font = ImageFont.truetype(REGULAR_FONT, 30)
-    draw.text((padding, height - padding - 30), f"Headline as seen {seen_at}", font=caption_font, fill=(110, 110, 118))
+        draw.text((THUMB_PADDING, THUMB_PADDING + int(row * size * THUMB_LINE_SPACING)), line, font=font,
+                  fill=(24, 24, 27))
+    rule_y = THUMB_HEIGHT - THUMB_PADDING - 52
+    draw.rectangle([THUMB_PADDING, rule_y, THUMB_PADDING + 90, rule_y + 4], fill=(24, 24, 27))
+    caption_font = ImageFont.truetype(REGULAR_FONT, THUMB_CAPTION_SIZE)
+    draw.text((THUMB_PADDING, THUMB_HEIGHT - THUMB_PADDING - THUMB_CAPTION_SIZE), f"Headline as seen {seen_at}",
+              font=caption_font, fill=(110, 110, 118))
     return encode_png(image)
 
 
@@ -240,7 +293,7 @@ class PostRef(TypedDict):
 class ExistingThread(TypedDict):
     root: PostRef
     last: PostRef
-    alts: set[str]  # alt texts of the thread's diff images, "Before: ...\nAfter: ..."
+    replies: dict[str, str]  # uri of each diff reply, by its alt text "Before: ...\nAfter: ..."
 
 
 _TID_ALPHABET = "234567abcdefghijklmnopqrstuvwxyz"
@@ -312,8 +365,9 @@ def fetch_own_threads(client: Client, actor: str,
         reply = post.record.reply
         root = PostRef(uri=reply.root.uri, cid=reply.root.cid) if reply else PostRef(uri=post.uri, cid=post.cid)
         thread = threads.setdefault(root["uri"], ExistingThread(root=root, last=PostRef(uri=post.uri, cid=post.cid),
-                                                                alts=set()))
-        thread["alts"].update(image.alt for image in getattr(post.embed, "images", None) or [])
+                                                                replies={}))
+        for image in getattr(post.embed, "images", None) or []:
+            thread["replies"].setdefault(image.alt, post.uri)  # newest post first, so the newest wins
         if not reply:
             card = getattr(post.embed, "external", None)
             quoted = getattr(getattr(post.embed, "record", None), "uri", None)
@@ -614,49 +668,46 @@ def change_key(change: dict) -> str:
 
 
 class PostLog:
-    """posted.json: the changes already posted (or skipped), each article's thread, and when recent
-    posts were made (for the hourly cap). A read-only log (dry run) still updates in memory."""
+    """posted.json: the changes already posted and each article's thread, so replies can continue it. A
+    read-only log (dry run) still updates in memory. Nothing is ever forgotten: changes.jsonl never forgets
+    a change either, and both grow by only a few lines a day."""
 
     def __init__(self, path: Path, writable: bool):
         data = read_json(path, {})
         if data.get("schema") != POST_LOG_SCHEMA:
-            data = {"schema": POST_LOG_SCHEMA, "posted": {}, "threads": {}, "recent": []}
+            data = {"schema": POST_LOG_SCHEMA, "posted": {}, "threads": {}}
         self.path, self.writable, self.data = path, writable, data
         self.modified = False
-
-    def prune(self, now: float) -> None:
-        for section in ("posted", "threads"):
-            self.data[section] = {k: v for k, v in self.data[section].items() if now - v["at"] <= TTL_SECONDS}
+        self._recovered_replies: dict[str, dict[str, str]] = {}  # threads found among the account's own posts
 
     def is_recorded(self, change: dict) -> bool:
         return change_key(change) in self.data["posted"]
 
-    def record_skipped(self, change: dict, reason: str, now: float) -> None:
-        self.data["posted"][change_key(change)] = {"skipped": reason, "at": now}
+    def record_posted(self, change: dict, uri: str, now: float) -> None:
+        self.data["posted"][change_key(change)] = {"uri": uri, "at": now}
         self.modified = True
 
     def thread(self, article_id: str) -> dict | None:
         return self.data["threads"].get(article_id)
 
-    def adopt_thread(self, article_id: str, root: PostRef, last: PostRef, now: float) -> dict:
+    def set_thread(self, article_id: str, root: PostRef, last: PostRef, now: float) -> dict:
         thread = {"root": root, "last": last, "at": now}
         self.data["threads"][article_id] = thread
         self.modified = True
         return thread
 
-    def start_thread(self, article_id: str, root: PostRef, now: float) -> dict:
-        self.data["recent"].append(now)
-        return self.adopt_thread(article_id, root, root, now)
+    def adopt_existing(self, article_id: str, existing: ExistingThread, now: float) -> None:
+        """Continue a thread that was found among the account's own posts."""
+        self.set_thread(article_id, existing["root"], existing["last"], now)
+        self._recovered_replies[article_id] = existing["replies"]
+
+    def find_recovered_reply(self, change: dict) -> str | None:
+        """The uri of the reply that already posted this change, if the thread was recovered and has it."""
+        return self._recovered_replies.get(change["content_id"], {}).get(diff_alt_text(change))
 
     def record_reply(self, thread: dict, change: dict, reply: PostRef, now: float) -> None:
         thread.update(last=reply, at=now)
-        self.data["posted"][change_key(change)] = {"uri": reply["uri"], "at": now}
-        self.data["recent"].append(now)
-        self.modified = True
-
-    def posts_in_last_hour(self, now: float) -> int:
-        self.data["recent"] = [t for t in self.data["recent"] if now - t < 3600]
-        return len(self.data["recent"])
+        self.record_posted(change, reply["uri"], now)
 
     def save(self) -> None:
         if self.writable:
@@ -671,73 +722,59 @@ def read_changes(path: Path) -> list[dict]:
         return []
 
 
-def split_pending(changes: list[dict], log: PostLog, now: float, max_age_minutes: int) -> tuple[list[dict], list[dict]]:
-    """(to post, too old) among the title changes not yet recorded, oldest first."""
+def pending_changes(changes: list[dict], log: PostLog) -> list[dict]:
+    """The title changes not yet recorded, oldest first."""
     titles = (c for c in changes if c["field"] == TITLE_FIELD and c.get("version"))
-    to_post, too_old = [], []
-    for change in sorted(titles, key=lambda c: c["detected_at"]):
-        if log.is_recorded(change):
-            continue
-        age_minutes = (now - datetime.fromisoformat(change["detected_at"]).timestamp()) / 60
-        (too_old if age_minutes > max_age_minutes else to_post).append(change)
-    return to_post, too_old
+    return [c for c in sorted(titles, key=lambda c: c["detected_at"]) if not log.is_recorded(c)]
 
 
-def publish_thread(article_id: str, changes: list[dict], article: dict, log: PostLog,
-                   publisher: Publisher, now: float, hourly_cap: int) -> None:
-    """Post an article's pending changes, one reply each, in its thread. The thread comes from posted.json,
-    else from the account's own posts, else it is started."""
-    print(f"### {changes[0]['url']}\n")
-    thread = log.thread(article_id)
-    if thread is None:
+def publish_change(change: dict, article: dict, number: int, log: PostLog, publisher: Publisher, now: float) -> None:
+    """Post one change as a reply in its article's thread. The thread comes from posted.json, else from the
+    account's own posts, else it is started with this change's "before" headline."""
+    article_id = change["content_id"]
+    print(f"### {change['url']}\n")
+    if log.thread(article_id) is None:
         existing = publisher.find_existing_thread(article_id)
         if existing:
             print("_Continuing the thread found among the account's own posts._\n")
-            thread = log.adopt_thread(article_id, existing["root"], existing["last"], now)
-            for change in changes:
-                if diff_alt_text(change) in existing["alts"]:
-                    log.record_skipped(change, "already posted", now)
-            changes = [change for change in changes if not log.is_recorded(change)]
+            log.adopt_existing(article_id, existing, now)
         else:
-            if log.posts_in_last_hour(now) >= hourly_cap:
-                print(f"_Hourly cap ({hourly_cap}) reached; this stays pending._\n")
-                return
-            thread = log.start_thread(article_id, publisher.post_root(changes[0], article), now)
+            root = publisher.post_root(change, article)
+            log.set_thread(article_id, root, root, now)
         log.save()
-    for number, change in enumerate(changes, 1):
-        if log.posts_in_last_hour(now) >= hourly_cap:
-            print(f"_Hourly cap ({hourly_cap}) reached; the rest stay pending._\n")
-            return
-        reply = publisher.post_diff_reply(change, thread, number)
-        log.record_reply(thread, change, reply, now)
+    if uri := log.find_recovered_reply(change):  # the recovered thread already has this change
+        log.record_posted(change, uri, now)
         log.save()
+        return
+    thread = log.thread(article_id)
+    reply = publisher.post_diff_reply(change, thread, number)
+    log.record_reply(thread, change, reply, now)
+    log.save()
 
 
 def run(args: argparse.Namespace) -> int:
     now = time.time()
     log = PostLog(args.data_dir / "posted.json", writable=not args.dry_run)
-    log.prune(now)
     articles = read_json(args.data_dir / "state.json", {}).get("articles", {})
     publisher = DryRunPublisher(args.preview_dir) if args.dry_run else LivePublisher()
 
-    to_post, too_old = split_pending(read_changes(args.data_dir / "changes.jsonl"), log, now, args.max_age)
-    for change in too_old:  # remember them, so they aren't reported on every run
-        log.record_skipped(change, "too old", now)
-
+    pending = pending_changes(read_changes(args.data_dir / "changes.jsonl"), log)
     print(f"## Bluesky poster{' (dry run: nothing is posted, no login)' if args.dry_run else ''}\n")
-    print(f"{len(to_post)} title change(s) to post, {len(too_old)} skipped as older than {args.max_age} minutes.\n")
-
-    by_article: dict[str, list[dict]] = {}
-    for change in to_post:
-        by_article.setdefault(change["content_id"], []).append(change)
+    print(f"{len(pending)} title change(s) to post.\n")
 
     failures = 0
-    for article_id, article_changes in by_article.items():
+    failed_articles: set[str] = set()
+    numbers: dict[str, int] = {}  # how many of an article's changes were handled in this run
+    for change in pending:  # oldest first
+        article_id = change["content_id"]
+        if article_id in failed_articles:
+            continue  # keep the article's edits in order: they wait for the next run
+        numbers[article_id] = numbers.get(article_id, 0) + 1
         try:
-            publish_thread(article_id, article_changes, articles.get(article_id) or {}, log, publisher,
-                           now, args.hourly_cap)
+            publish_change(change, articles.get(article_id) or {}, numbers[article_id], log, publisher, now)
         except Exception as exc:  # one failing article must not stop the others
             failures += 1
+            failed_articles.add(article_id)
             print(f"error posting {article_id}: {exc}", file=sys.stderr)
     log.save()
     publisher.finish()
@@ -754,10 +791,6 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true",
                         help="no login, no posts, no posted.json; print what would be posted and render previews")
     parser.add_argument("--preview-dir", type=Path, default=Path("preview"), help="dry run: where the images go")
-    parser.add_argument("--max-age", type=int, default=120,
-                        help="skip changes detected more than this many minutes ago")
-    parser.add_argument("--hourly-cap", type=int, default=12,
-                        help="maximum posts per hour (a thread's root counts as one)")
     return run(parser.parse_args())
 
 
