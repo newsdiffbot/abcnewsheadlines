@@ -1,8 +1,6 @@
 name: poll
 
 on:
-  schedule:
-    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -44,16 +42,7 @@ jobs:
         env:
           BSKY_USERNAME: ${{ secrets.BSKY_USERNAME }}
           BSKY_PASSWORD: ${{ secrets.BSKY_PASSWORD }}
-        # Dry run: nothing is posted; what would be posted goes to the step summary. Remove --dry-run to post.
-        run: uv run --frozen poster.py --dry-run | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload dry-run output (images and would-post.json)
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: preview
-          path: preview
-          if-no-files-found: ignore
+        run: uv run --frozen poster.py | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Save state
         # Only on the default branch, and only if something changed. always(): a post that succeeded must not be
