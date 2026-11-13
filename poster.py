@@ -1,6 +1,7 @@
 """Post the headline changes found by poller.py to Bluesky (run it after poller.py).
 
-Only full-title changes are posted (`detail.title` in changes.jsonl). The scripts share files in --data-dir:
+Only full-title changes are posted (`detail.title` in changes.jsonl), and not those of live blogs (articles of
+type "blog" in changes.jsonl), whose headlines are rewritten as the story runs. The scripts share files in --data-dir:
   changes.jsonl  written by poller.py. A change is pending until its key "<content_id>:<version>" (the
                  CMS revision, independent of when we polled) is recorded in posted.json.
   state.json     written by poller.py, read here for the article's description and first-seen time.
@@ -61,6 +62,7 @@ IpldLink = models.blob_ref.IpldLink
 TIMEZONE = ZoneInfo("Australia/Sydney")  # for the times shown on images
 
 TITLE_FIELD = "detail.title"
+SKIPPED_ARTICLE_TYPES = {"blog"}  # live blogs are retitled as they run and again when they close: not posted
 REPLY_TEXT = "Change in Headline"
 POST_LANGUAGES = ["en-AU"]
 MAX_POST_LENGTH = 290  # Bluesky allows 300 characters
@@ -742,10 +744,12 @@ def read_changes(path: Path) -> list[dict]:
         return []
 
 
-def pending_changes(changes: list[dict], log: PostLog) -> list[dict]:
-    """The title changes not yet recorded, oldest first."""
+def pending_changes(changes: list[dict], log: PostLog) -> tuple[list[dict], int]:
+    """The title changes not yet recorded, oldest first, and how many more were left out as live blog changes."""
     titles = (c for c in changes if c["field"] == TITLE_FIELD and c.get("version"))
-    return [c for c in sorted(titles, key=lambda c: c["detected_at"]) if not log.is_recorded(c)]
+    unrecorded = [c for c in sorted(titles, key=lambda c: c["detected_at"]) if not log.is_recorded(c)]
+    pending = [c for c in unrecorded if c.get("type") not in SKIPPED_ARTICLE_TYPES]
+    return pending, len(unrecorded) - len(pending)
 
 
 def publish_change(change: dict, article: dict, number: int, log: PostLog, publisher: Publisher, now: float) -> None:
@@ -778,9 +782,9 @@ def run(args: argparse.Namespace) -> int:
     articles = read_json(args.data_dir / "state.json", {}).get("articles", {})
     publisher = DryRunPublisher(args.preview_dir) if args.dry_run else LivePublisher()
 
-    pending = pending_changes(read_changes(args.data_dir / "changes.jsonl"), log)
+    pending, skipped = pending_changes(read_changes(args.data_dir / "changes.jsonl"), log)
     print(f"## Bluesky poster{' (dry run: nothing is posted, no login)' if args.dry_run else ''}\n")
-    print(f"{len(pending)} title change(s) to post.\n")
+    print(f"{len(pending)} title change(s) to post" + (f" ({skipped} to live blogs skipped)." if skipped else ".") + "\n")
 
     failures = 0
     failed_articles: set[str] = set()

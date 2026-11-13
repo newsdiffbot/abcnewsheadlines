@@ -10,7 +10,8 @@ State and the change log live in --data-dir:
                                 description, published, updated, version, type,
                                 production_unit, authors, byline, topics, keywords}}}}
   changes.jsonl  one line per detected headline change (append-only): detected_at, content_id, url,
-                 field, old, new, list_updated, version (null for list.* fields)
+                 field, old, new, list_updated, version (null for list.* fields), type (the article's type,
+                 e.g. "web" or "blog"; null if unknown)
   snapshots/     with --snapshot only: a timestamped copy of state.json from every run (debugging)
 
 Each run lists the --limit newest articles (default and maximum 250), fetches every listed article's
@@ -223,6 +224,7 @@ def find_changes(article_id: str, article: dict, section: str, new_fields: dict,
                 "new": new,
                 "list_updated": list_fields["updated"],
                 "version": new_fields.get("version") if section == "detail" else None,
+                "type": new_fields.get("type") if section == "detail" else (article.get("detail") or {}).get("type"),
             })
     return changes
 
