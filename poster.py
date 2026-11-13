@@ -129,6 +129,22 @@ def encode_png(image: Image.Image) -> bytes:
     return buffer.getvalue()
 
 
+def changed_spans(old_tokens: list[str], new_tokens: list[str]) -> list[tuple[str, int, int, int, int]]:
+    """difflib's opcodes, except that changes separated only by spaces are one change: a lone space is the same
+    in both headlines, so difflib would otherwise pair "to fall as" -> "opens lower," as "to" -> "opens", "fall as" -> "lower,"."""
+    opcodes = difflib.SequenceMatcher(None, old_tokens, new_tokens, autojunk=False).get_opcodes()
+    spans: list[tuple[str, int, int, int, int]] = []
+    for i, (op, old_start, old_end, new_start, new_end) in enumerate(opcodes):
+        between_changes = 0 < i < len(opcodes) - 1  # an equal op is never next to another equal op
+        if op == "equal" and between_changes and not any(t.strip() for t in old_tokens[old_start:old_end]):
+            op = "replace"  # only spaces: part of the change around it, not a stretch of unchanged words
+        if op != "equal" and spans and spans[-1][0] != "equal":
+            _, old_start, _, new_start, _ = spans.pop()  # joins the change before it
+            op = "replace"
+        spans.append((op, old_start, old_end, new_start, new_end))
+    return spans
+
+
 def diff_tokens(old: str, new: str) -> list[Token]:
     old_tokens, new_tokens = TOKEN_PATTERN.findall(old.strip()), TOKEN_PATTERN.findall(new.strip())
     old_words = [t for t in old_tokens if t.strip()]
@@ -139,8 +155,7 @@ def diff_tokens(old: str, new: str) -> list[Token]:
         return [*removed, Token(UNCHANGED, LINE_BREAK), *added]  # a full replacement: the new text starts a new line
 
     tokens: list[Token] = []
-    matcher = difflib.SequenceMatcher(None, old_tokens, new_tokens, autojunk=False)
-    for op, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+    for op, old_start, old_end, new_start, new_end in changed_spans(old_tokens, new_tokens):
         if op == "equal":
             tokens += [Token(UNCHANGED, t) for t in old_tokens[old_start:old_end]]
             continue
