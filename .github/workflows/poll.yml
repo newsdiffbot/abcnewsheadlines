@@ -2,7 +2,7 @@ name: poll
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -14,8 +14,8 @@ permissions:
 
 jobs:
   poll:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
     defaults:
       run:
         shell: bash # with pipefail, so `| tee` doesn't hide a failing script
@@ -48,7 +48,7 @@ jobs:
         run: uv run --frozen poster.py --dry-run | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload dry-run output (images and would-post.json)
-        if: ${{ always() && github.event_name == 'workflow_dispatch' }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: preview
